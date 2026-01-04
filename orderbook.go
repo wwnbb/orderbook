@@ -44,27 +44,14 @@ const btreeDegree = 32
 func NewOrderBook(maxDepth int) *OrderBook {
 	return &OrderBook{
 		maxDepth: maxDepth,
-		bids:     &bnode{isLeaf: true},
 		asks:     &bnode{isLeaf: true},
+		bids:     &bnode{isLeaf: true},
 	}
 }
 
 func (ob *OrderBook) rebuildHeads() {
 	ob.bidHead = ob.findHighestBid(ob.bids)
 	ob.askHead = ob.findLowestAsk(ob.asks)
-}
-
-func (ob *OrderBook) findHighestBid(n *bnode) *priceLevel {
-	if n == nil || len(n.prices) == 0 {
-		return nil
-	}
-	for !n.isLeaf {
-		n = n.children[len(n.children)-1]
-	}
-	if len(n.levels) == 0 {
-		return nil
-	}
-	return n.levels[len(n.levels)-1]
 }
 
 func (ob *OrderBook) findLowestAsk(n *bnode) *priceLevel {
@@ -78,6 +65,19 @@ func (ob *OrderBook) findLowestAsk(n *bnode) *priceLevel {
 		return nil
 	}
 	return n.levels[0]
+}
+
+func (ob *OrderBook) findHighestBid(n *bnode) *priceLevel {
+	if n == nil || len(n.prices) == 0 {
+		return nil
+	}
+	for !n.isLeaf {
+		n = n.children[len(n.children)-1]
+	}
+	if len(n.levels) == 0 {
+		return nil
+	}
+	return n.levels[len(n.levels)-1]
 }
 
 func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) {

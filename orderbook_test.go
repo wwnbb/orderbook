@@ -3,23 +3,28 @@ package orderbook
 import (
 	"fmt"
 	"math/rand"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 )
 
 func printAsksBids(asks, bids []Order) {
-	fmt.Println("Asks:")
+	fmt.Println("=== Order Book ===")
 
-	for _, ask := range slices.Backward(asks) {
-		fmt.Printf("Price: %f, Quantity: %f\n", ask.Price, ask.Quantity)
+	fmt.Println("Asks (highest -> lowest):")
+	for i := len(asks) - 1; i >= 0; i-- {
+		ask := asks[i]
+		fmt.Printf("  %10.4f | qty: %10.4f\n", ask.Price, ask.Quantity)
 	}
-	fmt.Println("--------------------")
+
+	fmt.Println("----------------------------")
+
+	fmt.Println("Bids (highest -> lowest):")
 	for _, bid := range bids {
-		fmt.Printf("Price: %f, Quantity: %f\n", bid.Price, bid.Quantity)
+		fmt.Printf("  %10.4f | qty: %10.4f\n", bid.Price, bid.Quantity)
 	}
-	fmt.Println("BIDS")
+
+	fmt.Println("============================")
 }
 
 func TestRemove(t *testing.T) {
@@ -528,4 +533,41 @@ func BenchmarkConcurrentReadsAndWrites(b *testing.B) {
 
 	close(stop)
 	wg.Wait()
+}
+
+func TestOrderbook1mCollision(t *testing.T) {
+	ob := NewOrderBook(10)
+	asks := make([]Order, 10)
+	bids := make([]Order, 10)
+	for i := 0; i < 10; i++ {
+		asks[i] = Order{Price: 99.0 - float64(i), Quantity: 10.0}
+		bids[i] = Order{Price: 100.0 + float64(i), Quantity: 10.0}
+	}
+	ob.UpdateSnapshot(bids, asks)
+	printOb := func() {
+		asks, bids := ob.GetDepth(10)
+		printAsksBids(asks, bids)
+	}
+	printOb()
+
+	asksDelta := []Order{
+		{Price: 98.9, Quantity: 1},
+	}
+	bidsDelta := []Order{
+		{Price: 98.8, Quantity: 1},
+	}
+	ob.UpdateSnapshot(asksDelta, bidsDelta)
+	printOb()
+	asksDelta = []Order{
+		{Price: 97.9, Quantity: 1},
+	}
+	bidsDelta = []Order{
+		{Price: 97.8, Quantity: 1},
+	}
+	ob.UpdateSnapshot(asksDelta, bidsDelta)
+	printOb()
+	ob.UpdateDelta(
+		[]Order{{Price: 97.9, Quantity: 0}},
+		[]Order{{Price: 97.8, Quantity: 0}})
+	printOb()
 }
