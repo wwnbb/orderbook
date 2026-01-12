@@ -460,10 +460,23 @@ func BenchmarkGetDepth(b *testing.B) {
 }
 
 func BenchmarkUpdateDelta(b *testing.B) {
-	ob := NewOrderBook(100)
+	ob := NewOrderBook(1000)
+	asks := make([]Order, 1000)
+	bids := make([]Order, 1000)
+	for i := 0; i < 1000; i++ {
+		asks[i] = Order{Price: 2000.0 + float64(i), Quantity: 10.0}
+		bids[i] = Order{Price: 1999.0 + float64(i), Quantity: 10.0}
+	}
 	ob.UpdateSnapshot(
-		[]Order{{Price: 102.0, Quantity: 10.0}}, // asks
-		[]Order{{Price: 100.0, Quantity: 10.0}}, // bids
+		[]Order{
+			{Price: 2301.0, Quantity: 11.0},
+			{Price: 2983.0, Quantity: 16.0},
+		}, // asks
+		[]Order{
+			{Price: 1070.0, Quantity: 10.0},
+			{Price: 1060.0, Quantity: 0.0},
+			{Price: 1070.0, Quantity: 99.0},
+		}, // bids
 	)
 
 	b.ResetTimer()
@@ -1201,4 +1214,20 @@ func TestSimpleRemoveAfterSplit(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestBidAsksOrder(t *testing.T) {
+	ob := NewOrderBook(10)
+
+	asks := make([]Order, 10)
+	for i := 0; i < 10; i++ {
+		asks[i] = Order{Price: float64(1010 - i), Quantity: 1.0}
+	}
+	bids := make([]Order, 10)
+	for i := 0; i < 10; i++ {
+		bids[i] = Order{Price: float64(990 + i), Quantity: 1.0}
+	}
+	ob.UpdateSnapshot(asks, bids)
+	asks, bids = ob.GetDepth(2)
+	printAsksBids(asks, bids)
 }
