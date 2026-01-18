@@ -60,13 +60,17 @@ type OrderBook struct {
 	bidDepth int         // current number of bid levels
 	askDepth int         // current number of ask levels
 	version  uint64
+
+	// HFT optimization: reusable buffer for removal operations to avoid allocations
+	removalBuffer []int64
 }
 
 func NewOrderBook(maxDepth int) *OrderBook {
 	return &OrderBook{
-		maxDepth: maxDepth,
-		bids:     &bnode{isLeaf: true},
-		asks:     &bnode{isLeaf: true},
+		maxDepth:      maxDepth,
+		bids:          &bnode{isLeaf: true},
+		asks:          &bnode{isLeaf: true},
+		removalBuffer: make([]int64, 0, 128), // Pre-allocate buffer for HFT optimization
 	}
 }
 
@@ -230,13 +234,14 @@ func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) {
 			}
 		}
 
-		toRemove := make([]int64, 0)
+		// HFT optimization: reuse buffer instead of allocation
+		ob.removalBuffer = ob.removalBuffer[:0]
 		curr := ob.bidHead
 		for curr != nil && curr.price > highestBidInt {
-			toRemove = append(toRemove, curr.price)
+			ob.removalBuffer = append(ob.removalBuffer, curr.price)
 			curr = curr.prev
 		}
-		for _, p := range toRemove {
+		for _, p := range ob.removalBuffer {
 			ob.removeFromTree(ob.bids, p, true)
 		}
 
@@ -263,13 +268,14 @@ func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) {
 			}
 		}
 
-		toRemove := make([]int64, 0)
+		// HFT optimization: reuse buffer instead of allocation
+		ob.removalBuffer = ob.removalBuffer[:0]
 		curr := ob.askHead
 		for curr != nil && curr.price < lowestAskInt {
-			toRemove = append(toRemove, curr.price)
+			ob.removalBuffer = append(ob.removalBuffer, curr.price)
 			curr = curr.next
 		}
-		for _, p := range toRemove {
+		for _, p := range ob.removalBuffer {
 			ob.removeFromTree(ob.asks, p, false)
 		}
 
@@ -292,26 +298,28 @@ func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) {
 	// Iterate until collision is resolved or one side is empty
 	for ob.bidHead != nil && ob.askHead != nil && ob.bidHead.price >= ob.askHead.price {
 		// Remove bids >= lowest ask
-		toRemove := make([]int64, 0)
+		// HFT optimization: reuse buffer instead of allocation
+		ob.removalBuffer = ob.removalBuffer[:0]
 		curr := ob.bidHead
 		for curr != nil && curr.price >= ob.askHead.price {
-			toRemove = append(toRemove, curr.price)
+			ob.removalBuffer = append(ob.removalBuffer, curr.price)
 			curr = curr.prev
 		}
-		for _, p := range toRemove {
+		for _, p := range ob.removalBuffer {
 			ob.removeFromTree(ob.bids, p, true)
 		}
 		ob.bidHead = ob.findHighestBid(ob.bids)
 
 		// Also remove asks <= highest bid (symmetric fix)
 		if ob.bidHead != nil && ob.askHead != nil && ob.bidHead.price >= ob.askHead.price {
-			toRemove = make([]int64, 0)
+			// HFT optimization: reuse buffer instead of allocation
+			ob.removalBuffer = ob.removalBuffer[:0]
 			curr = ob.askHead
 			for curr != nil && curr.price <= ob.bidHead.price {
-				toRemove = append(toRemove, curr.price)
+				ob.removalBuffer = append(ob.removalBuffer, curr.price)
 				curr = curr.next
 			}
-			for _, p := range toRemove {
+			for _, p := range ob.removalBuffer {
 				ob.removeFromTree(ob.asks, p, false)
 			}
 			ob.askHead = ob.findLowestAsk(ob.asks)
