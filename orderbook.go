@@ -8,11 +8,21 @@ import (
 	"sync/atomic"
 )
 
-// Epsilon для сравнения float64
-const epsilon = 1e-9
-
 // Степень B-дерева (минимальное количество ключей в узле = btreeDegree-1)
 const btreeDegree = 32
+
+// priceScale - множитель для конвертации float64 в int64 (8 знаков после запятой)
+const priceScale = 100000000.0 // 1e8
+
+// toInt64 конвертирует float64 цену в int64 для внутреннего хранения
+func toInt64(f float64) int64 {
+	return int64(math.Round(f * priceScale))
+}
+
+// toFloat64 конвертирует int64 цену обратно в float64 для публичного API
+func toFloat64(i int64) float64 {
+	return float64(i) / priceScale
+}
 
 type Order struct {
 	Price     float64
@@ -21,14 +31,14 @@ type Order struct {
 }
 
 type priceLevel struct {
-	price    float64
+	price    int64 // Internal representation in int64
 	quantity float64
 	next     *priceLevel
 	prev     *priceLevel
 }
 
 type bnode struct {
-	prices   []float64
+	prices   []int64 // Internal representation in int64
 	levels   []*priceLevel
 	children []*bnode
 	next     *bnode
@@ -40,37 +50,16 @@ type bnode struct {
 type OrderBook struct {
 	maxDepth int
 
-	mu      sync.RWMutex
-	bids    *bnode
-	asks    *bnode
-	bidHead *priceLevel
-	askHead *priceLevel
-	version uint64
-}
-
-// floatEquals сравнивает два float64 с учётом погрешности
-func floatEquals(a, b float64) bool {
-	return math.Abs(a-b) < epsilon
-}
-
-// floatLess проверяет a < b с учётом погрешности
-func floatLess(a, b float64) bool {
-	return a < b-epsilon
-}
-
-// floatGreater проверяет a > b с учётом погрешности
-func floatGreater(a, b float64) bool {
-	return a > b+epsilon
-}
-
-// floatGreaterOrEqual проверяет a >= b с учётом погрешности
-func floatGreaterOrEqual(a, b float64) bool {
-	return a >= b-epsilon
-}
-
-// floatLessOrEqual проверяет a <= b с учётом погрешности
-func floatLessOrEqual(a, b float64) bool {
-	return a <= b+epsilon
+	mu       sync.RWMutex
+	bids     *bnode
+	asks     *bnode
+	bidHead  *priceLevel // highest bid (best bid)
+	askHead  *priceLevel // lowest ask (best ask)
+	bidTail  *priceLevel // lowest bid (worst bid)
+	askTail  *priceLevel // highest ask (worst ask)
+	bidDepth int         // current number of bid levels
+	askDepth int         // current number of ask levels
+	version  uint64
 }
 
 func NewOrderBook(maxDepth int) *OrderBook {
@@ -84,6 +73,10 @@ func NewOrderBook(maxDepth int) *OrderBook {
 func (ob *OrderBook) rebuildHeads() {
 	ob.bidHead = ob.findHighestBid(ob.bids)
 	ob.askHead = ob.findLowestAsk(ob.asks)
+	ob.bidTail = ob.findLowestBid(ob.bids)
+	ob.askTail = ob.findHighestAsk(ob.asks)
+	ob.bidDepth = ob.countLevelsFromHead(ob.bidHead, true)
+	ob.askDepth = ob.countLevelsFromHead(ob.askHead, false)
 }
 
 func (ob *OrderBook) findHighestBid(n *bnode) *priceLevel {
@@ -118,6 +111,60 @@ func (ob *OrderBook) findLowestAsk(n *bnode) *priceLevel {
 	return n.levels[0]
 }
 
+func (ob *OrderBook) findLowestBid(n *bnode) *priceLevel {
+	if n == nil {
+		return nil
+	}
+	for !n.isLeaf {
+		if len(n.children) == 0 {
+			return nil
+		}
+		n = n.children[0]
+	}
+	if len(n.levels) == 0 {
+		return nil
+	}
+	return n.levels[0]
+}
+
+func (ob *OrderBook) findHighestAsk(n *bnode) *priceLevel {
+	if n == nil {
+		return nil
+	}
+	for !n.isLeaf {
+		if len(n.children) == 0 {
+			return nil
+		}
+		n = n.children[len(n.children)-1]
+	}
+	if len(n.levels) == 0 {
+		return nil
+	}
+	return n.levels[len(n.levels)-1]
+}
+
+// countLevelsFromHead counts levels starting from head using linked list
+// isBid: true for bids (walk prev), false for asks (walk next)
+func (ob *OrderBook) countLevelsFromHead(head *priceLevel, isBid bool) int {
+	if head == nil {
+		return 0
+	}
+	count := 1
+	curr := head
+	if isBid {
+		for curr.prev != nil {
+			count++
+			curr = curr.prev
+		}
+	} else {
+		for curr.next != nil {
+			count++
+			curr = curr.next
+		}
+	}
+	return count
+}
+
 // countLevels подсчитывает количество уровней в дереве
 func (ob *OrderBook) countLevels(n *bnode) int {
 	if n == nil {
@@ -143,28 +190,29 @@ func (ob *OrderBook) trimToMaxDepth() {
 		return
 	}
 
-	count := 0
-	curr := ob.bidHead
-	for curr != nil && count < ob.maxDepth {
-		count++
-		curr = curr.prev
-	}
-	for curr != nil {
-		toRemove := curr
-		curr = curr.prev
-		ob.removeBid(toRemove.price)
+	// Optimized: O(1) check + O(log N) removal instead of O(N) traversal
+	// Remove worst bids (lowest prices) if depth exceeds limit
+	for ob.bidDepth > ob.maxDepth && ob.bidTail != nil {
+		toRemove := ob.bidTail.price
+		ob.removeFromTree(ob.bids, toRemove, true)
+		ob.bidHead = ob.findHighestBid(ob.bids)
+		ob.bidTail = ob.findLowestBid(ob.bids)
+		ob.bidDepth--
+		if ob.bidDepth < 0 {
+			ob.bidDepth = 0
+		}
 	}
 
-	count = 0
-	curr = ob.askHead
-	for curr != nil && count < ob.maxDepth {
-		count++
-		curr = curr.next
-	}
-	for curr != nil {
-		toRemove := curr
-		curr = curr.next
-		ob.removeAsk(toRemove.price)
+	// Remove worst asks (highest prices) if depth exceeds limit
+	for ob.askDepth > ob.maxDepth && ob.askTail != nil {
+		toRemove := ob.askTail.price
+		ob.removeFromTree(ob.asks, toRemove, false)
+		ob.askHead = ob.findLowestAsk(ob.asks)
+		ob.askTail = ob.findHighestAsk(ob.asks)
+		ob.askDepth--
+		if ob.askDepth < 0 {
+			ob.askDepth = 0
+		}
 	}
 }
 
@@ -174,26 +222,28 @@ func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) {
 
 	// Bids processing
 	if len(bids) > 0 {
-		highestBid := bids[0].Price
+		highestBidInt := toInt64(bids[0].Price)
 		for _, bid := range bids {
-			if floatGreater(bid.Price, highestBid) {
-				highestBid = bid.Price
+			bidInt := toInt64(bid.Price)
+			if bidInt > highestBidInt {
+				highestBidInt = bidInt
 			}
 		}
 
-		toRemove := make([]float64, 0)
+		toRemove := make([]int64, 0)
 		curr := ob.bidHead
-		for curr != nil && floatGreater(curr.price, highestBid) {
+		for curr != nil && curr.price > highestBidInt {
 			toRemove = append(toRemove, curr.price)
 			curr = curr.prev
 		}
 		for _, p := range toRemove {
-			ob.removeBid(p)
+			ob.removeFromTree(ob.bids, p, true)
 		}
 
 		for _, order := range bids {
-			if floatGreater(order.Quantity, 0) {
-				level := ob.findBid(order.Price)
+			if order.Quantity > 0 {
+				priceInt := toInt64(order.Price)
+				level := ob.findBid(priceInt)
 				if level != nil {
 					level.quantity = order.Quantity
 				} else {
@@ -205,26 +255,28 @@ func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) {
 
 	// Asks processing
 	if len(asks) > 0 {
-		lowestAsk := asks[0].Price
+		lowestAskInt := toInt64(asks[0].Price)
 		for _, ask := range asks {
-			if floatLess(ask.Price, lowestAsk) {
-				lowestAsk = ask.Price
+			askInt := toInt64(ask.Price)
+			if askInt < lowestAskInt {
+				lowestAskInt = askInt
 			}
 		}
 
-		toRemove := make([]float64, 0)
+		toRemove := make([]int64, 0)
 		curr := ob.askHead
-		for curr != nil && floatLess(curr.price, lowestAsk) {
+		for curr != nil && curr.price < lowestAskInt {
 			toRemove = append(toRemove, curr.price)
 			curr = curr.next
 		}
 		for _, p := range toRemove {
-			ob.removeAsk(p)
+			ob.removeFromTree(ob.asks, p, false)
 		}
 
 		for _, order := range asks {
-			if floatGreater(order.Quantity, 0) {
-				level := ob.findAsk(order.Price)
+			if order.Quantity > 0 {
+				priceInt := toInt64(order.Price)
+				level := ob.findAsk(priceInt)
 				if level != nil {
 					level.quantity = order.Quantity
 				} else {
@@ -238,29 +290,29 @@ func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) {
 
 	// Исправление пересечений bid >= ask (symmetric fix for both sides)
 	// Iterate until collision is resolved or one side is empty
-	for ob.bidHead != nil && ob.askHead != nil && floatGreaterOrEqual(ob.bidHead.price, ob.askHead.price) {
+	for ob.bidHead != nil && ob.askHead != nil && ob.bidHead.price >= ob.askHead.price {
 		// Remove bids >= lowest ask
-		toRemove := make([]float64, 0)
+		toRemove := make([]int64, 0)
 		curr := ob.bidHead
-		for curr != nil && floatGreaterOrEqual(curr.price, ob.askHead.price) {
+		for curr != nil && curr.price >= ob.askHead.price {
 			toRemove = append(toRemove, curr.price)
 			curr = curr.prev
 		}
 		for _, p := range toRemove {
-			ob.removeBid(p)
+			ob.removeFromTree(ob.bids, p, true)
 		}
 		ob.bidHead = ob.findHighestBid(ob.bids)
 
 		// Also remove asks <= highest bid (symmetric fix)
-		if ob.bidHead != nil && ob.askHead != nil && floatGreaterOrEqual(ob.bidHead.price, ob.askHead.price) {
-			toRemove = make([]float64, 0)
+		if ob.bidHead != nil && ob.askHead != nil && ob.bidHead.price >= ob.askHead.price {
+			toRemove = make([]int64, 0)
 			curr = ob.askHead
-			for curr != nil && floatLessOrEqual(curr.price, ob.bidHead.price) {
+			for curr != nil && curr.price <= ob.bidHead.price {
 				toRemove = append(toRemove, curr.price)
 				curr = curr.next
 			}
 			for _, p := range toRemove {
-				ob.removeAsk(p)
+				ob.removeFromTree(ob.asks, p, false)
 			}
 			ob.askHead = ob.findLowestAsk(ob.asks)
 		}
@@ -296,7 +348,7 @@ func (ob *OrderBook) GetBestBid() (price float64, quantity float64, ok bool) {
 	if ob.bidHead == nil {
 		return 0, 0, false
 	}
-	return ob.bidHead.price, ob.bidHead.quantity, true
+	return toFloat64(ob.bidHead.price), ob.bidHead.quantity, true
 }
 
 func (ob *OrderBook) GetBestAsk() (price float64, quantity float64, ok bool) {
@@ -306,7 +358,7 @@ func (ob *OrderBook) GetBestAsk() (price float64, quantity float64, ok bool) {
 	if ob.askHead == nil {
 		return 0, 0, false
 	}
-	return ob.askHead.price, ob.askHead.quantity, true
+	return toFloat64(ob.askHead.price), ob.askHead.quantity, true
 }
 
 func (ob *OrderBook) GetDepth(levels int) (asks, bids []Order) {
@@ -323,13 +375,13 @@ func (ob *OrderBook) getDepthInternal(levels int) (asks, bids []Order) {
 
 	curr := ob.bidHead
 	for curr != nil && len(bids) < levels {
-		bids = append(bids, Order{Price: curr.price, Quantity: curr.quantity})
+		bids = append(bids, Order{Price: toFloat64(curr.price), Quantity: curr.quantity})
 		curr = curr.prev
 	}
 
 	curr = ob.askHead
 	for curr != nil && len(asks) < levels {
-		asks = append(asks, Order{Price: curr.price, Quantity: curr.quantity})
+		asks = append(asks, Order{Price: toFloat64(curr.price), Quantity: curr.quantity})
 		curr = curr.next
 	}
 
@@ -343,7 +395,7 @@ func (ob *OrderBook) GetMid() (mid float64, ok bool) {
 	if ob.bidHead == nil || ob.askHead == nil {
 		return 0, false
 	}
-	return (ob.bidHead.price + ob.askHead.price) / 2, true
+	return toFloat64(ob.bidHead.price+ob.askHead.price) / 2, true
 }
 
 func (ob *OrderBook) GetSpread() (spread float64, ok bool) {
@@ -353,7 +405,7 @@ func (ob *OrderBook) GetSpread() (spread float64, ok bool) {
 	if ob.bidHead == nil || ob.askHead == nil {
 		return 0, false
 	}
-	return ob.askHead.price - ob.bidHead.price, true
+	return toFloat64(ob.askHead.price - ob.bidHead.price), true
 }
 
 func (ob *OrderBook) GetVersion() uint64 {
@@ -361,24 +413,27 @@ func (ob *OrderBook) GetVersion() uint64 {
 }
 
 func (ob *OrderBook) insertBid(price float64, quantity float64) {
-	level := ob.searchOrInsert(ob.bids, price, true)
+	priceInt := toInt64(price)
+	level := ob.searchOrInsert(ob.bids, priceInt, true)
 	if level != nil {
 		level.quantity = quantity
 	}
 }
 
 func (ob *OrderBook) insertAsk(price float64, quantity float64) {
-	level := ob.searchOrInsert(ob.asks, price, false)
+	priceInt := toInt64(price)
+	level := ob.searchOrInsert(ob.asks, priceInt, false)
 	if level != nil {
 		level.quantity = quantity
 	}
 }
 
 func (ob *OrderBook) updateBid(price float64, quantity float64) {
-	if floatEquals(quantity, 0) {
+	if quantity == 0 {
 		ob.removeBid(price)
 	} else {
-		level := ob.findBid(price)
+		priceInt := toInt64(price)
+		level := ob.findBid(priceInt)
 		if level != nil {
 			level.quantity = quantity
 		} else {
@@ -388,10 +443,11 @@ func (ob *OrderBook) updateBid(price float64, quantity float64) {
 }
 
 func (ob *OrderBook) updateAsk(price float64, quantity float64) {
-	if floatEquals(quantity, 0) {
+	if quantity == 0 {
 		ob.removeAsk(price)
 	} else {
-		level := ob.findAsk(price)
+		priceInt := toInt64(price)
+		level := ob.findAsk(priceInt)
 		if level != nil {
 			level.quantity = quantity
 		} else {
@@ -401,33 +457,53 @@ func (ob *OrderBook) updateAsk(price float64, quantity float64) {
 }
 
 func (ob *OrderBook) removeBid(price float64) {
-	ob.removeFromTree(ob.bids, price, true)
+	priceInt := toInt64(price)
+	// Check if the price exists before removing
+	if ob.findBid(priceInt) == nil {
+		return
+	}
+	ob.removeFromTree(ob.bids, priceInt, true)
 	ob.bidHead = ob.findHighestBid(ob.bids)
+	ob.bidTail = ob.findLowestBid(ob.bids)
+	ob.bidDepth--
+	if ob.bidDepth < 0 {
+		ob.bidDepth = 0
+	}
 }
 
 func (ob *OrderBook) removeAsk(price float64) {
-	ob.removeFromTree(ob.asks, price, false)
+	priceInt := toInt64(price)
+	// Check if the price exists before removing
+	if ob.findAsk(priceInt) == nil {
+		return
+	}
+	ob.removeFromTree(ob.asks, priceInt, false)
 	ob.askHead = ob.findLowestAsk(ob.asks)
+	ob.askTail = ob.findHighestAsk(ob.asks)
+	ob.askDepth--
+	if ob.askDepth < 0 {
+		ob.askDepth = 0
+	}
 }
 
-func (ob *OrderBook) findBid(price float64) *priceLevel {
-	return ob.search(ob.bids, price)
+func (ob *OrderBook) findBid(priceInt int64) *priceLevel {
+	return ob.search(ob.bids, priceInt)
 }
 
-func (ob *OrderBook) findAsk(price float64) *priceLevel {
-	return ob.search(ob.asks, price)
+func (ob *OrderBook) findAsk(priceInt int64) *priceLevel {
+	return ob.search(ob.asks, priceInt)
 }
 
 // search ищет priceLevel по цене в B-дереве
-func (ob *OrderBook) search(n *bnode, price float64) *priceLevel {
+func (ob *OrderBook) search(n *bnode, priceInt int64) *priceLevel {
 	if n == nil {
 		return nil
 	}
 
 	for {
-		idx := ob.findKeyIndex(n.prices, price)
+		idx := ob.findKeyIndex(n.prices, priceInt)
 
-		if idx < len(n.prices) && floatEquals(n.prices[idx], price) {
+		if idx < len(n.prices) && n.prices[idx] == priceInt {
 			if n.isLeaf {
 				return n.levels[idx]
 			}
@@ -452,11 +528,11 @@ func (ob *OrderBook) search(n *bnode, price float64) *priceLevel {
 }
 
 // findKeyIndex находит индекс первого ключа >= price
-func (ob *OrderBook) findKeyIndex(prices []float64, price float64) int {
+func (ob *OrderBook) findKeyIndex(prices []int64, priceInt int64) int {
 	lo, hi := 0, len(prices)
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		if floatLess(prices[mid], price) {
+		if prices[mid] < priceInt {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -466,7 +542,7 @@ func (ob *OrderBook) findKeyIndex(prices []float64, price float64) int {
 }
 
 // searchOrInsert ищет или вставляет priceLevel
-func (ob *OrderBook) searchOrInsert(root *bnode, price float64, isBid bool) *priceLevel {
+func (ob *OrderBook) searchOrInsert(root *bnode, priceInt int64, isBid bool) *priceLevel {
 	if root == nil {
 		return nil
 	}
@@ -485,16 +561,16 @@ func (ob *OrderBook) searchOrInsert(root *bnode, price float64, isBid bool) *pri
 		root = newRoot
 	}
 
-	return ob.insertNonFull(root, price, isBid)
+	return ob.insertNonFull(root, priceInt, isBid)
 }
 
 // insertNonFull вставляет в узел, который гарантированно не полон
-func (ob *OrderBook) insertNonFull(n *bnode, price float64, isBid bool) *priceLevel {
+func (ob *OrderBook) insertNonFull(n *bnode, priceInt int64, isBid bool) *priceLevel {
 	for {
-		idx := ob.findKeyIndex(n.prices, price)
+		idx := ob.findKeyIndex(n.prices, priceInt)
 
 		// Если ключ уже существует
-		if idx < len(n.prices) && floatEquals(n.prices[idx], price) {
+		if idx < len(n.prices) && n.prices[idx] == priceInt {
 			if n.isLeaf {
 				return n.levels[idx]
 			}
@@ -508,8 +584,8 @@ func (ob *OrderBook) insertNonFull(n *bnode, price float64, isBid bool) *priceLe
 
 		if n.isLeaf {
 			// Вставляем новый уровень
-			level := &priceLevel{price: price}
-			ob.insertIntoLeafAt(n, idx, price, level)
+			level := &priceLevel{price: priceInt}
+			ob.insertIntoLeafAt(n, idx, priceInt, level)
 			return level
 		}
 
@@ -524,9 +600,9 @@ func (ob *OrderBook) insertNonFull(n *bnode, price float64, isBid bool) *priceLe
 		if len(child.prices) >= 2*btreeDegree-1 {
 			ob.splitChild(n, idx)
 			// После разделения определяем, в какой узел идти
-			if floatGreater(price, n.prices[idx]) {
+			if priceInt > n.prices[idx] {
 				idx++
-			} else if floatEquals(price, n.prices[idx]) {
+			} else if priceInt == n.prices[idx] {
 				// Ключ поднялся из разделения
 				if n.isLeaf {
 					return n.levels[idx]
@@ -543,11 +619,11 @@ func (ob *OrderBook) insertNonFull(n *bnode, price float64, isBid bool) *priceLe
 }
 
 // insertIntoLeafAt вставляет уровень в лист на позицию idx
-func (ob *OrderBook) insertIntoLeafAt(n *bnode, idx int, price float64, level *priceLevel) {
+func (ob *OrderBook) insertIntoLeafAt(n *bnode, idx int, priceInt int64, level *priceLevel) {
 	// Расширяем слайсы
 	n.prices = append(n.prices, 0)
 	copy(n.prices[idx+1:], n.prices[idx:])
-	n.prices[idx] = price
+	n.prices[idx] = priceInt
 
 	n.levels = append(n.levels, nil)
 	copy(n.levels[idx+1:], n.levels[idx:])
@@ -600,7 +676,7 @@ func (ob *OrderBook) splitChild(parent *bnode, childIdx int) {
 	newNode := &bnode{
 		isLeaf: fullNode.isLeaf,
 		parent: parent,
-		prices: make([]float64, newPricesLen),
+		prices: make([]int64, newPricesLen),
 		prev:   fullNode,
 	}
 
@@ -650,12 +726,12 @@ func (ob *OrderBook) splitChild(parent *bnode, childIdx int) {
 }
 
 // removeFromTree удаляет элемент из B-дерева
-func (ob *OrderBook) removeFromTree(root *bnode, price float64, isBid bool) {
+func (ob *OrderBook) removeFromTree(root *bnode, priceInt int64, isBid bool) {
 	if root == nil || (len(root.prices) == 0 && len(root.children) == 0) {
 		return
 	}
 
-	ob.removeRecursive(root, price, isBid)
+	ob.removeRecursive(root, priceInt, isBid)
 
 	// Если корень пуст, но есть дети, делаем ребёнка новым корнем
 	if len(root.prices) == 0 && len(root.children) > 0 {
@@ -669,11 +745,11 @@ func (ob *OrderBook) removeFromTree(root *bnode, price float64, isBid bool) {
 	}
 }
 
-func (ob *OrderBook) removeRecursive(n *bnode, price float64, isBid bool) bool {
-	idx := ob.findKeyIndex(n.prices, price)
+func (ob *OrderBook) removeRecursive(n *bnode, priceInt int64, isBid bool) bool {
+	idx := ob.findKeyIndex(n.prices, priceInt)
 
 	if n.isLeaf {
-		if idx < len(n.prices) && floatEquals(n.prices[idx], price) {
+		if idx < len(n.prices) && n.prices[idx] == priceInt {
 			ob.removeFromLeafAt(n, idx)
 			return true
 		}
@@ -683,7 +759,7 @@ func (ob *OrderBook) removeRecursive(n *bnode, price float64, isBid bool) bool {
 	// Внутренний узел
 	// В B+ дереве, если ключ совпадает с separator в внутреннем узле,
 	// продолжаем поиск в правом поддереве, так как данные находятся только в листьях
-	if idx < len(n.prices) && floatEquals(n.prices[idx], price) {
+	if idx < len(n.prices) && n.prices[idx] == priceInt {
 		// Переходим в правое поддерево где находятся ключи >= separator
 		idx = idx + 1
 	}
@@ -697,12 +773,12 @@ func (ob *OrderBook) removeRecursive(n *bnode, price float64, isBid bool) bool {
 
 	// Обеспечиваем, что у ребёнка достаточно ключей
 	if len(child.prices) < btreeDegree {
-		ob.ensureMinKeys(n, idx) // <- убрали isBid
+		ob.ensureMinKeys(n, idx)
 		// После балансировки нужно пересчитать индекс и проверить, не переместился ли ключ
-		idx = ob.findKeyIndex(n.prices, price)
+		idx = ob.findKeyIndex(n.prices, priceInt)
 
 		// Ключ мог переместиться в текущий узел после балансировки
-		if idx < len(n.prices) && floatEquals(n.prices[idx], price) {
+		if idx < len(n.prices) && n.prices[idx] == priceInt {
 			return ob.removeFromInternal(n, idx, isBid)
 		}
 
@@ -715,7 +791,7 @@ func (ob *OrderBook) removeRecursive(n *bnode, price float64, isBid bool) bool {
 		child = n.children[idx]
 	}
 
-	return ob.removeRecursive(child, price, isBid)
+	return ob.removeRecursive(child, priceInt, isBid)
 }
 
 // removeFromLeafAt удаляет элемент из листа по индексу
@@ -816,7 +892,7 @@ func (ob *OrderBook) borrowFromLeft(parent *bnode, childIdx int) {
 		lastLevel := leftSibling.levels[len(leftSibling.levels)-1]
 		lastPrice := leftSibling.prices[len(leftSibling.prices)-1]
 
-		child.prices = append([]float64{lastPrice}, child.prices...)
+		child.prices = append([]int64{lastPrice}, child.prices...)
 		child.levels = append([]*priceLevel{lastLevel}, child.levels...)
 
 		leftSibling.prices = leftSibling.prices[:len(leftSibling.prices)-1]
@@ -824,7 +900,7 @@ func (ob *OrderBook) borrowFromLeft(parent *bnode, childIdx int) {
 
 		parent.prices[childIdx-1] = child.prices[0]
 	} else {
-		child.prices = append([]float64{parent.prices[childIdx-1]}, child.prices...)
+		child.prices = append([]int64{parent.prices[childIdx-1]}, child.prices...)
 
 		lastChild := leftSibling.children[len(leftSibling.children)-1]
 		child.children = append([]*bnode{lastChild}, child.children...)
@@ -904,6 +980,10 @@ func (ob *OrderBook) Clear() {
 	ob.asks = &bnode{isLeaf: true}
 	ob.bidHead = nil
 	ob.askHead = nil
+	ob.bidTail = nil
+	ob.askTail = nil
+	ob.bidDepth = 0
+	ob.askDepth = 0
 	atomic.AddUint64(&ob.version, 1)
 }
 
@@ -916,7 +996,7 @@ func (ob *OrderBook) IsEmpty() bool {
 
 func hasNonZeroQuantity(orders []Order) bool {
 	for _, order := range orders {
-		if floatGreater(order.Quantity, 0) {
+		if order.Quantity > 0 {
 			return true
 		}
 	}
@@ -955,7 +1035,7 @@ func (ob *OrderBook) dumpNode(sb *strings.Builder, n *bnode, depth int) {
 				sb.WriteString(", ")
 			}
 			if level != nil {
-				sb.WriteString(fmt.Sprintf("%.2f:%.4f", level.price, level.quantity))
+				sb.WriteString(fmt.Sprintf("%.2f:%.4f", toFloat64(level.price), level.quantity))
 			} else {
 				sb.WriteString("nil")
 			}
@@ -981,22 +1061,28 @@ func (ob *OrderBook) validateAndPanic(asksInput, bidsInput []Order) {
 
 	hadCollision := false
 	if hasNonZeroAsks && hasNonZeroBids {
-		highestBid := -1.0
-		lowestAsk := -1.0
+		highestBidInt := int64(-1)
+		lowestAskInt := int64(-1)
 
 		for _, bid := range bidsInput {
-			if floatGreater(bid.Quantity, 0) && (highestBid < 0 || floatGreater(bid.Price, highestBid)) {
-				highestBid = bid.Price
+			if bid.Quantity > 0 {
+				bidInt := toInt64(bid.Price)
+				if highestBidInt < 0 || bidInt > highestBidInt {
+					highestBidInt = bidInt
+				}
 			}
 		}
 
 		for _, ask := range asksInput {
-			if floatGreater(ask.Quantity, 0) && (lowestAsk < 0 || floatLess(ask.Price, lowestAsk)) {
-				lowestAsk = ask.Price
+			if ask.Quantity > 0 {
+				askInt := toInt64(ask.Price)
+				if lowestAskInt < 0 || askInt < lowestAskInt {
+					lowestAskInt = askInt
+				}
 			}
 		}
 
-		if highestBid >= 0 && lowestAsk >= 0 && floatGreaterOrEqual(highestBid, lowestAsk) {
+		if highestBidInt >= 0 && lowestAskInt >= 0 && highestBidInt >= lowestAskInt {
 			hadCollision = true
 		}
 	}
@@ -1028,11 +1114,11 @@ func (ob *OrderBook) validateAndPanic(asksInput, bidsInput []Order) {
 		panicMsg.WriteString("\n=== Orderbook State ===\n")
 		panicMsg.WriteString(fmt.Sprintf("BidHead: %v\n", ob.bidHead != nil))
 		if ob.bidHead != nil {
-			panicMsg.WriteString(fmt.Sprintf("  Best Bid: Price=%.4f, Quantity=%.4f\n", ob.bidHead.price, ob.bidHead.quantity))
+			panicMsg.WriteString(fmt.Sprintf("  Best Bid: Price=%.4f, Quantity=%.4f\n", toFloat64(ob.bidHead.price), ob.bidHead.quantity))
 		}
 		panicMsg.WriteString(fmt.Sprintf("AskHead: %v\n", ob.askHead != nil))
 		if ob.askHead != nil {
-			panicMsg.WriteString(fmt.Sprintf("  Best Ask: Price=%.4f, Quantity=%.4f\n", ob.askHead.price, ob.askHead.quantity))
+			panicMsg.WriteString(fmt.Sprintf("  Best Ask: Price=%.4f, Quantity=%.4f\n", toFloat64(ob.askHead.price), ob.askHead.quantity))
 		}
 
 		asks, bids := ob.getDepthInternal(10)
