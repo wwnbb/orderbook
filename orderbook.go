@@ -3,6 +3,7 @@ package orderbook
 import (
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -63,14 +64,17 @@ type OrderBook struct {
 
 	// HFT optimization: reusable buffer for removal operations to avoid allocations
 	removalBuffer []int64
+	// sorted non-zero prices of the snapshot side being applied
+	snapshotPrices []int64
 }
 
 func NewOrderBook(maxDepth int) *OrderBook {
 	return &OrderBook{
-		maxDepth:      maxDepth,
-		bids:          &bnode{isLeaf: true},
-		asks:          &bnode{isLeaf: true},
-		removalBuffer: make([]int64, 0, 128), // Pre-allocate buffer for HFT optimization
+		maxDepth:       maxDepth,
+		bids:           &bnode{isLeaf: true},
+		asks:           &bnode{isLeaf: true},
+		removalBuffer:  make([]int64, 0, 128), // Pre-allocate buffer for HFT optimization
+		snapshotPrices: make([]int64, 0, 128),
 	}
 }
 
@@ -224,21 +228,21 @@ func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
+	// A depth-limited snapshot is authoritative from the touch down to its
+	// last level: levels in that range missing from the snapshot no longer
+	// exist and are removed. Levels beyond the snapshot's range are kept.
+
 	// Bids processing
 	if len(bids) > 0 {
-		highestBidInt := toInt64(bids[0].Price)
-		for _, bid := range bids {
-			bidInt := toInt64(bid.Price)
-			if bidInt > highestBidInt {
-				highestBidInt = bidInt
-			}
-		}
+		lowestBidInt, highestBidInt := ob.loadSnapshotPrices(bids)
 
 		// HFT optimization: reuse buffer instead of allocation
 		ob.removalBuffer = ob.removalBuffer[:0]
 		curr := ob.bidHead
-		for curr != nil && curr.price > highestBidInt {
-			ob.removalBuffer = append(ob.removalBuffer, curr.price)
+		for curr != nil && curr.price >= lowestBidInt {
+			if curr.price > highestBidInt || !ob.inSnapshot(curr.price) {
+				ob.removalBuffer = append(ob.removalBuffer, curr.price)
+			}
 			curr = curr.prev
 		}
 		for _, p := range ob.removalBuffer {
@@ -260,19 +264,15 @@ func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) {
 
 	// Asks processing
 	if len(asks) > 0 {
-		lowestAskInt := toInt64(asks[0].Price)
-		for _, ask := range asks {
-			askInt := toInt64(ask.Price)
-			if askInt < lowestAskInt {
-				lowestAskInt = askInt
-			}
-		}
+		lowestAskInt, highestAskInt := ob.loadSnapshotPrices(asks)
 
 		// HFT optimization: reuse buffer instead of allocation
 		ob.removalBuffer = ob.removalBuffer[:0]
 		curr := ob.askHead
-		for curr != nil && curr.price < lowestAskInt {
-			ob.removalBuffer = append(ob.removalBuffer, curr.price)
+		for curr != nil && curr.price <= highestAskInt {
+			if curr.price < lowestAskInt || !ob.inSnapshot(curr.price) {
+				ob.removalBuffer = append(ob.removalBuffer, curr.price)
+			}
 			curr = curr.next
 		}
 		for _, p := range ob.removalBuffer {
@@ -329,6 +329,31 @@ func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) {
 	ob.trimToMaxDepth()
 	// ob.validateAndPanic(asks, bids)
 	atomic.AddUint64(&ob.version, 1)
+}
+
+// loadSnapshotPrices stores the sorted prices of the non-zero snapshot levels
+// in ob.snapshotPrices and returns the price range covered by the snapshot.
+func (ob *OrderBook) loadSnapshotPrices(orders []Order) (lowest, highest int64) {
+	lowest = toInt64(orders[0].Price)
+	highest = lowest
+	ob.snapshotPrices = ob.snapshotPrices[:0]
+	for _, order := range orders {
+		priceInt := toInt64(order.Price)
+		lowest = min(lowest, priceInt)
+		highest = max(highest, priceInt)
+		if order.Quantity > 0 {
+			ob.snapshotPrices = append(ob.snapshotPrices, priceInt)
+		}
+	}
+	slices.Sort(ob.snapshotPrices)
+	return lowest, highest
+}
+
+// inSnapshot reports whether priceInt is a non-zero level of the snapshot
+// side loaded by loadSnapshotPrices.
+func (ob *OrderBook) inSnapshot(priceInt int64) bool {
+	_, found := slices.BinarySearch(ob.snapshotPrices, priceInt)
+	return found
 }
 
 func (ob *OrderBook) UpdateDelta(asks, bids []Order) {
