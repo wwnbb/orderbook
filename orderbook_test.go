@@ -1,6 +1,7 @@
 package orderbook
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -1037,7 +1038,7 @@ func TestSimpleRemoveAfterSplit(t *testing.T) {
 
 	for i := 0; i < 70; i++ {
 		priceFloat := float64(1000 + i)
-		priceInt := toInt64(priceFloat)
+		priceInt := ob.toInt64(priceFloat)
 		found := ob.findAsk(priceInt)
 		if found == nil {
 			t.Errorf("Price %.0f not found after insertion", priceFloat)
@@ -1046,7 +1047,7 @@ func TestSimpleRemoveAfterSplit(t *testing.T) {
 
 	ob.UpdateDelta([]Order{{Price: 1031, Quantity: 0}}, []Order{})
 
-	found := ob.findAsk(toInt64(1031))
+	found := ob.findAsk(ob.toInt64(1031))
 	if found != nil {
 		t.Errorf("Price 1031 still found after removal! qty=%.4f", found.quantity)
 	}
@@ -1135,5 +1136,173 @@ func BenchmarkUpdateSnapshotWithDepthLimit(b *testing.B) {
 				ob.UpdateSnapshot(asks, bids)
 			}
 		})
+	}
+}
+
+func TestPriceDecimalsDefault(t *testing.T) {
+	ob := NewOrderBook(10)
+	if got := ob.PriceDecimals(); got != 8 {
+		t.Fatalf("PriceDecimals = %d, want %d", got, DefaultPriceDecimals)
+	}
+
+	if err := ob.UpdateSnapshot(
+		[]Order{{Price: 0.00001001, Quantity: 1}},
+		[]Order{{Price: 0.00001, Quantity: 1}},
+	); err != nil {
+		t.Fatalf("UpdateSnapshot: %v", err)
+	}
+
+	bid, _, ok := ob.GetBestBid()
+	if !ok || bid != 0.00001 {
+		t.Fatalf("best bid = %v (ok=%v), want exactly 0.00001", bid, ok)
+	}
+	ask, _, ok := ob.GetBestAsk()
+	if !ok || ask != 0.00001001 {
+		t.Fatalf("best ask = %v (ok=%v), want exactly 0.00001001", ask, ok)
+	}
+}
+
+func TestPriceFinerThanScaleIsRefused(t *testing.T) {
+	ob := NewOrderBook(10)
+	if err := ob.UpdateSnapshot(
+		[]Order{{Price: 0.0002, Quantity: 1}},
+		[]Order{{Price: 0.0001, Quantity: 1}},
+	); err != nil {
+		t.Fatalf("UpdateSnapshot: %v", err)
+	}
+	version := ob.GetVersion()
+
+	err := ob.UpdateDelta([]Order{}, []Order{{Price: 0.000010005, Quantity: 5}})
+	if !errors.Is(err, ErrPriceNotRepresentable) {
+		t.Fatalf("UpdateDelta error = %v, want ErrPriceNotRepresentable", err)
+	}
+
+	bid, _, ok := ob.GetBestBid()
+	if !ok || bid != 0.0001 {
+		t.Fatalf("best bid = %v (ok=%v), want 0.0001 after refused delta", bid, ok)
+	}
+	if got := ob.GetVersion(); got != version {
+		t.Fatalf("version = %d, want %d after refused delta", got, version)
+	}
+
+	err = ob.UpdateSnapshot([]Order{{Price: 0.0000001234, Quantity: 1}}, []Order{})
+	if !errors.Is(err, ErrPriceNotRepresentable) {
+		t.Fatalf("UpdateSnapshot error = %v, want ErrPriceNotRepresentable", err)
+	}
+
+	bid, _, ok = ob.GetBestBid()
+	if !ok || bid != 0.0001 {
+		t.Fatalf("best bid = %v (ok=%v), want 0.0001 after refused snapshot", bid, ok)
+	}
+	ask, _, ok := ob.GetBestAsk()
+	if !ok || ask != 0.0002 {
+		t.Fatalf("best ask = %v (ok=%v), want 0.0002 after refused snapshot", ask, ok)
+	}
+	if got := ob.GetVersion(); got != version {
+		t.Fatalf("version = %d, want %d after refused snapshot", got, version)
+	}
+}
+
+func TestFinerScaleKeepsPricesExact(t *testing.T) {
+	ob, err := NewOrderBookWithDecimals(10, 12)
+	if err != nil {
+		t.Fatalf("NewOrderBookWithDecimals(10, 12): %v", err)
+	}
+	if got := ob.PriceDecimals(); got != 12 {
+		t.Fatalf("PriceDecimals = %d, want 12", got)
+	}
+	if err := ob.UpdateSnapshot(
+		[]Order{{Price: 0.000010006, Quantity: 1}},
+		[]Order{{Price: 0.000010005, Quantity: 1}, {Price: 0.000010004, Quantity: 1}},
+	); err != nil {
+		t.Fatalf("UpdateSnapshot at 12 decimals: %v", err)
+	}
+	bid, _, ok := ob.GetBestBid()
+	if !ok || bid != 0.000010005 {
+		t.Fatalf("best bid = %v (ok=%v), want exactly 0.000010005", bid, ok)
+	}
+	ask, _, ok := ob.GetBestAsk()
+	if !ok || ask != 0.000010006 {
+		t.Fatalf("best ask = %v (ok=%v), want exactly 0.000010006", ask, ok)
+	}
+
+	ob, err = NewOrderBookWithDecimals(10, 14)
+	if err != nil {
+		t.Fatalf("NewOrderBookWithDecimals(10, 14): %v", err)
+	}
+	if err := ob.UpdateSnapshot(
+		[]Order{{Price: 0.00000000000564, Quantity: 1}},
+		[]Order{{Price: 0.00000000000563, Quantity: 1}},
+	); err != nil {
+		t.Fatalf("UpdateSnapshot at 14 decimals: %v", err)
+	}
+	bid, _, ok = ob.GetBestBid()
+	if !ok || bid != 0.00000000000563 {
+		t.Fatalf("best bid = %v (ok=%v), want exactly 0.00000000000563", bid, ok)
+	}
+
+	ob, err = NewOrderBookWithDecimals(10, 10)
+	if err != nil {
+		t.Fatalf("NewOrderBookWithDecimals(10, 10): %v", err)
+	}
+	if err := ob.UpdateSnapshot([]Order{}, []Order{{Price: 0.0000001234, Quantity: 1}}); err != nil {
+		t.Fatalf("UpdateSnapshot at 10 decimals: %v", err)
+	}
+	bid, _, ok = ob.GetBestBid()
+	if !ok || bid != 0.0000001234 {
+		t.Fatalf("best bid = %v (ok=%v), want exactly 0.0000001234", bid, ok)
+	}
+}
+
+func TestPriceDecimalsBounds(t *testing.T) {
+	for _, decimals := range []int{-1, MaxPriceDecimals + 1} {
+		if _, err := NewOrderBookWithDecimals(1, decimals); err == nil {
+			t.Fatalf("NewOrderBookWithDecimals(1, %d) succeeded, want error", decimals)
+		}
+	}
+	if _, err := NewOrderBookWithDecimals(1, MaxPriceDecimals); err != nil {
+		t.Fatalf("NewOrderBookWithDecimals(1, %d): %v", MaxPriceDecimals, err)
+	}
+
+	ob, err := NewOrderBookWithDecimals(1, 12)
+	if err != nil {
+		t.Fatalf("NewOrderBookWithDecimals(1, 12): %v", err)
+	}
+	if err := ob.UpdateDelta([]Order{}, []Order{{Price: 9300000, Quantity: 1}}); !errors.Is(err, ErrPriceNotRepresentable) {
+		t.Fatalf("UpdateDelta at price*1e12 = 9.3e18: error = %v, want ErrPriceNotRepresentable", err)
+	}
+	if err := ob.UpdateDelta([]Order{}, []Order{{Price: 1000.5, Quantity: 1}}); err != nil {
+		t.Fatalf("UpdateDelta(1000.5): %v", err)
+	}
+	bid, _, ok := ob.GetBestBid()
+	if !ok || bid != 1000.5 {
+		t.Fatalf("best bid = %v (ok=%v), want exactly 1000.5", bid, ok)
+	}
+}
+
+func TestDefaultScaleTypicalPrices(t *testing.T) {
+	ob := NewOrderBook(10)
+	wantBids := []float64{65000.1, 0.5123}
+	wantAsks := []float64{65000.2, 123456.12345678}
+	if err := ob.UpdateSnapshot(
+		[]Order{{Price: wantAsks[0], Quantity: 1}, {Price: wantAsks[1], Quantity: 2}},
+		[]Order{{Price: wantBids[0], Quantity: 3}, {Price: wantBids[1], Quantity: 4}},
+	); err != nil {
+		t.Fatalf("UpdateSnapshot: %v", err)
+	}
+
+	asks, bids := ob.GetDepth(10)
+	if len(asks) != len(wantAsks) || len(bids) != len(wantBids) {
+		t.Fatalf("depth = %d asks, %d bids, want %d and %d", len(asks), len(bids), len(wantAsks), len(wantBids))
+	}
+	for i, want := range wantAsks {
+		if asks[i].Price != want {
+			t.Errorf("ask %d = %.17g, want %.17g", i, asks[i].Price, want)
+		}
+	}
+	for i, want := range wantBids {
+		if bids[i].Price != want {
+			t.Errorf("bid %d = %.17g, want %.17g", i, bids[i].Price, want)
+		}
 	}
 }

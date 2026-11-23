@@ -2,10 +2,24 @@ package orderbook
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"sort"
 	"testing"
 )
+
+// refScale is the price scale of the reference model: the default book's.
+var refScale = math.Pow10(DefaultPriceDecimals)
+
+// defaultPriceInt64 converts a price at DefaultPriceDecimals, the scale of the
+// books the reference model mirrors.
+func defaultPriceInt64(f float64) int64 {
+	return int64(math.Round(f * refScale))
+}
+
+func defaultPriceFloat64(i int64) float64 {
+	return float64(i) / refScale
+}
 
 // refBook is a plain map model of OrderBook semantics used to cross-check
 // the B+ tree implementation.
@@ -52,16 +66,16 @@ func (r *refBook) trim() {
 func (r *refBook) delta(asks, bids []Order) {
 	for _, o := range bids {
 		if o.Quantity == 0 {
-			delete(r.bids, toInt64(o.Price))
+			delete(r.bids, defaultPriceInt64(o.Price))
 		} else {
-			r.bids[toInt64(o.Price)] = o.Quantity
+			r.bids[defaultPriceInt64(o.Price)] = o.Quantity
 		}
 	}
 	for _, o := range asks {
 		if o.Quantity == 0 {
-			delete(r.asks, toInt64(o.Price))
+			delete(r.asks, defaultPriceInt64(o.Price))
 		} else {
-			r.asks[toInt64(o.Price)] = o.Quantity
+			r.asks[defaultPriceInt64(o.Price)] = o.Quantity
 		}
 	}
 	r.trim()
@@ -69,16 +83,16 @@ func (r *refBook) delta(asks, bids []Order) {
 
 func (r *refBook) snapshot(asks, bids []Order) {
 	if len(bids) > 0 {
-		hi := toInt64(bids[0].Price)
+		hi := defaultPriceInt64(bids[0].Price)
 		for _, o := range bids {
-			if p := toInt64(o.Price); p > hi {
+			if p := defaultPriceInt64(o.Price); p > hi {
 				hi = p
 			}
 		}
 		lo := hi
 		keep := map[int64]bool{}
 		for _, o := range bids {
-			p := toInt64(o.Price)
+			p := defaultPriceInt64(o.Price)
 			lo = min(lo, p)
 			if o.Quantity > 0 {
 				keep[p] = true
@@ -91,21 +105,21 @@ func (r *refBook) snapshot(asks, bids []Order) {
 		}
 		for _, o := range bids {
 			if o.Quantity > 0 {
-				r.bids[toInt64(o.Price)] = o.Quantity
+				r.bids[defaultPriceInt64(o.Price)] = o.Quantity
 			}
 		}
 	}
 	if len(asks) > 0 {
-		lo := toInt64(asks[0].Price)
+		lo := defaultPriceInt64(asks[0].Price)
 		for _, o := range asks {
-			if p := toInt64(o.Price); p < lo {
+			if p := defaultPriceInt64(o.Price); p < lo {
 				lo = p
 			}
 		}
 		hi := lo
 		keep := map[int64]bool{}
 		for _, o := range asks {
-			p := toInt64(o.Price)
+			p := defaultPriceInt64(o.Price)
 			hi = max(hi, p)
 			if o.Quantity > 0 {
 				keep[p] = true
@@ -118,7 +132,7 @@ func (r *refBook) snapshot(asks, bids []Order) {
 		}
 		for _, o := range asks {
 			if o.Quantity > 0 {
-				r.asks[toInt64(o.Price)] = o.Quantity
+				r.asks[defaultPriceInt64(o.Price)] = o.Quantity
 			}
 		}
 	}
@@ -217,13 +231,13 @@ func checkAgainstRef(t *testing.T, ob *OrderBook, ref *refBook, step int) {
 	}
 	for i, o := range bids {
 		p := wantBids[len(wantBids)-1-i]
-		if toInt64(o.Price) != p || o.Quantity != ref.bids[p] {
+		if defaultPriceInt64(o.Price) != p || o.Quantity != ref.bids[p] {
 			t.Fatalf("step %d: bid %d = %v, want %d:%v", step, i, o, p, ref.bids[p])
 		}
 	}
 	for i, o := range asks {
 		p := wantAsks[i]
-		if toInt64(o.Price) != p || o.Quantity != ref.asks[p] {
+		if defaultPriceInt64(o.Price) != p || o.Quantity != ref.asks[p] {
 			t.Fatalf("step %d: ask %d = %v, want %d:%v", step, i, o, p, ref.asks[p])
 		}
 	}
@@ -280,13 +294,13 @@ func runRandomized(t *testing.T, seed int64, maxDepth, steps, spread int) {
 			bids := genSide(rng, mid, true, 1+rng.Intn(30), spread, 40)
 			// The stream removes levels that drifted to the other side of mid.
 			for p := range ref.bids {
-				if p >= toInt64(float64(mid)/10) && rng.Intn(2) == 0 {
-					bids = append(bids, Order{Price: toFloat64(p), Quantity: 0})
+				if p >= defaultPriceInt64(float64(mid)/10) && rng.Intn(2) == 0 {
+					bids = append(bids, Order{Price: defaultPriceFloat64(p), Quantity: 0})
 				}
 			}
 			for p := range ref.asks {
-				if p <= toInt64(float64(mid)/10) && rng.Intn(2) == 0 {
-					asks = append(asks, Order{Price: toFloat64(p), Quantity: 0})
+				if p <= defaultPriceInt64(float64(mid)/10) && rng.Intn(2) == 0 {
+					asks = append(asks, Order{Price: defaultPriceFloat64(p), Quantity: 0})
 				}
 			}
 			ob.UpdateDelta(asks, bids)
@@ -381,7 +395,7 @@ func TestResyncStreamNoStaleLevels(t *testing.T) {
 			}
 			out := make([]Order, len(keys))
 			for i, k := range keys {
-				out[i] = Order{Price: toFloat64(k), Quantity: m[k]}
+				out[i] = Order{Price: defaultPriceFloat64(k), Quantity: m[k]}
 			}
 			return out
 		}
@@ -395,13 +409,13 @@ func TestResyncStreamNoStaleLevels(t *testing.T) {
 			asks := genSide(rng, mid, false, 1+rng.Intn(30), 40, 40)
 			bids := genSide(rng, mid, true, 1+rng.Intn(30), 40, 40)
 			for p := range truth.bids {
-				if p >= toInt64(float64(mid)/10) {
-					bids = append(bids, Order{Price: toFloat64(p), Quantity: 0})
+				if p >= defaultPriceInt64(float64(mid)/10) {
+					bids = append(bids, Order{Price: defaultPriceFloat64(p), Quantity: 0})
 				}
 			}
 			for p := range truth.asks {
-				if p <= toInt64(float64(mid)/10) {
-					asks = append(asks, Order{Price: toFloat64(p), Quantity: 0})
+				if p <= defaultPriceInt64(float64(mid)/10) {
+					asks = append(asks, Order{Price: defaultPriceFloat64(p), Quantity: 0})
 				}
 			}
 			truth.delta(asks, bids)
@@ -423,12 +437,12 @@ func TestResyncStreamNoStaleLevels(t *testing.T) {
 
 			gotAsks, gotBids := ob.GetDepth(depth)
 			for _, o := range gotAsks {
-				if _, ok := truth.asks[toInt64(o.Price)]; !ok {
+				if _, ok := truth.asks[defaultPriceInt64(o.Price)]; !ok {
 					t.Fatalf("seed %d step %d: stale ask %v", seed, step, o.Price)
 				}
 			}
 			for _, o := range gotBids {
-				if _, ok := truth.bids[toInt64(o.Price)]; !ok {
+				if _, ok := truth.bids[defaultPriceInt64(o.Price)]; !ok {
 					t.Fatalf("seed %d step %d: stale bid %v", seed, step, o.Price)
 				}
 			}

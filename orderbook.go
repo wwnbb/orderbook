@@ -1,6 +1,7 @@
 package orderbook
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -12,18 +13,14 @@ import (
 // Степень B-дерева (минимальное количество ключей в узле = btreeDegree-1)
 const btreeDegree = 32
 
-// priceScale - множитель для конвертации float64 в int64 (8 знаков после запятой)
-const priceScale = 100000000.0 // 1e8
+// DefaultPriceDecimals is the price scale of NewOrderBook: 1e-8.
+const DefaultPriceDecimals = 8
 
-// toInt64 конвертирует float64 цену в int64 для внутреннего хранения
-func toInt64(f float64) int64 {
-	return int64(math.Round(f * priceScale))
-}
+// MaxPriceDecimals is the finest price scale a book takes.
+const MaxPriceDecimals = 18
 
-// toFloat64 конвертирует int64 цену обратно в float64 для публичного API
-func toFloat64(i int64) float64 {
-	return float64(i) / priceScale
-}
+// ErrPriceNotRepresentable is returned for a price the book's scale cannot hold exactly.
+var ErrPriceNotRepresentable = errors.New("orderbook: price not representable at the book's scale")
 
 type Order struct {
 	Price     float64
@@ -50,6 +47,8 @@ type bnode struct {
 
 type OrderBook struct {
 	maxDepth int
+	decimals int     // prices are held in units of 10^-decimals
+	scale    float64 // 10^decimals
 
 	mu       sync.RWMutex
 	bids     *bnode
@@ -68,14 +67,71 @@ type OrderBook struct {
 	snapshotPrices []int64
 }
 
-func NewOrderBook(maxDepth int) *OrderBook {
+// NewOrderBookWithDecimals returns a book whose prices are held in units of 10^-decimals.
+// Prices are exact while price*10^decimals stays below 2^53; it must stay below 9.2e18.
+func NewOrderBookWithDecimals(maxDepth, decimals int) (*OrderBook, error) {
+	if decimals < 0 || decimals > MaxPriceDecimals {
+		return nil, fmt.Errorf("orderbook: price decimals %d outside 0..%d", decimals, MaxPriceDecimals)
+	}
 	return &OrderBook{
 		maxDepth:       maxDepth,
+		decimals:       decimals,
+		scale:          math.Pow10(decimals),
 		bids:           &bnode{isLeaf: true},
 		asks:           &bnode{isLeaf: true},
 		removalBuffer:  make([]int64, 0, 128), // Pre-allocate buffer for HFT optimization
 		snapshotPrices: make([]int64, 0, 128),
+	}, nil
+}
+
+// NewOrderBook returns a book that uses DefaultPriceDecimals.
+func NewOrderBook(maxDepth int) *OrderBook {
+	ob, _ := NewOrderBookWithDecimals(maxDepth, DefaultPriceDecimals)
+	return ob
+}
+
+// toInt64 конвертирует float64 цену в int64 для внутреннего хранения
+func (ob *OrderBook) toInt64(f float64) int64 {
+	return int64(math.Round(f * ob.scale))
+}
+
+// toFloat64 конвертирует int64 цену обратно в float64 для публичного API
+func (ob *OrderBook) toFloat64(i int64) float64 {
+	return float64(i) / ob.scale
+}
+
+// checkPrice reports whether f is held exactly at the book's scale: the
+// quantization error must be within float64's own resolution of f*scale.
+func (ob *OrderBook) checkPrice(f float64) error {
+	x := f * ob.scale
+	if math.IsNaN(x) || math.IsInf(x, 0) || math.Abs(x) >= 9.2e18 {
+		return fmt.Errorf("%w: %v at %d decimals (out of range)", ErrPriceNotRepresentable, f, ob.decimals)
 	}
+	if e := math.Abs(x - math.Round(x)); e > max(1e-6, math.Abs(x)*0x1p-50) {
+		return fmt.Errorf("%w: %v at %d decimals", ErrPriceNotRepresentable, f, ob.decimals)
+	}
+	return nil
+}
+
+// checkPrices returns the first price of asks or bids that the book's scale
+// cannot hold, including levels with zero quantity.
+func (ob *OrderBook) checkPrices(asks, bids []Order) error {
+	for _, order := range asks {
+		if err := ob.checkPrice(order.Price); err != nil {
+			return err
+		}
+	}
+	for _, order := range bids {
+		if err := ob.checkPrice(order.Price); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PriceDecimals returns the number of decimals the book holds prices at.
+func (ob *OrderBook) PriceDecimals() int {
+	return ob.decimals
 }
 
 func (ob *OrderBook) rebuildHeads() {
@@ -224,9 +280,16 @@ func (ob *OrderBook) trimToMaxDepth() {
 	}
 }
 
-func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) {
+// UpdateSnapshot replaces the price levels covered by the snapshot. It returns
+// ErrPriceNotRepresentable (wrapped) and leaves the book unchanged when a
+// price is finer than the book's scale.
+func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) error {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
+
+	if err := ob.checkPrices(asks, bids); err != nil {
+		return err
+	}
 
 	// A depth-limited snapshot is authoritative from the touch down to its
 	// last level: levels in that range missing from the snapshot no longer
@@ -251,7 +314,7 @@ func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) {
 
 		for _, order := range bids {
 			if order.Quantity > 0 {
-				priceInt := toInt64(order.Price)
+				priceInt := ob.toInt64(order.Price)
 				level := ob.findBid(priceInt)
 				if level != nil {
 					level.quantity = order.Quantity
@@ -281,7 +344,7 @@ func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) {
 
 		for _, order := range asks {
 			if order.Quantity > 0 {
-				priceInt := toInt64(order.Price)
+				priceInt := ob.toInt64(order.Price)
 				level := ob.findAsk(priceInt)
 				if level != nil {
 					level.quantity = order.Quantity
@@ -329,16 +392,17 @@ func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) {
 	ob.trimToMaxDepth()
 	// ob.validateAndPanic(asks, bids)
 	atomic.AddUint64(&ob.version, 1)
+	return nil
 }
 
 // loadSnapshotPrices stores the sorted prices of the non-zero snapshot levels
 // in ob.snapshotPrices and returns the price range covered by the snapshot.
 func (ob *OrderBook) loadSnapshotPrices(orders []Order) (lowest, highest int64) {
-	lowest = toInt64(orders[0].Price)
+	lowest = ob.toInt64(orders[0].Price)
 	highest = lowest
 	ob.snapshotPrices = ob.snapshotPrices[:0]
 	for _, order := range orders {
-		priceInt := toInt64(order.Price)
+		priceInt := ob.toInt64(order.Price)
 		lowest = min(lowest, priceInt)
 		highest = max(highest, priceInt)
 		if order.Quantity > 0 {
@@ -356,9 +420,16 @@ func (ob *OrderBook) inSnapshot(priceInt int64) bool {
 	return found
 }
 
-func (ob *OrderBook) UpdateDelta(asks, bids []Order) {
+// UpdateDelta applies incremental level updates. It returns
+// ErrPriceNotRepresentable (wrapped) and leaves the book unchanged when a
+// price is finer than the book's scale.
+func (ob *OrderBook) UpdateDelta(asks, bids []Order) error {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
+
+	if err := ob.checkPrices(asks, bids); err != nil {
+		return err
+	}
 
 	for _, order := range bids {
 		ob.updateBid(order.Price, order.Quantity)
@@ -372,6 +443,7 @@ func (ob *OrderBook) UpdateDelta(asks, bids []Order) {
 	ob.trimToMaxDepth()
 	// ob.validateAndPanic(asks, bids)
 	atomic.AddUint64(&ob.version, 1)
+	return nil
 }
 
 func (ob *OrderBook) GetBestBid() (price float64, quantity float64, ok bool) {
@@ -381,7 +453,7 @@ func (ob *OrderBook) GetBestBid() (price float64, quantity float64, ok bool) {
 	if ob.bidHead == nil {
 		return 0, 0, false
 	}
-	return toFloat64(ob.bidHead.price), ob.bidHead.quantity, true
+	return ob.toFloat64(ob.bidHead.price), ob.bidHead.quantity, true
 }
 
 func (ob *OrderBook) GetBestAsk() (price float64, quantity float64, ok bool) {
@@ -391,7 +463,7 @@ func (ob *OrderBook) GetBestAsk() (price float64, quantity float64, ok bool) {
 	if ob.askHead == nil {
 		return 0, 0, false
 	}
-	return toFloat64(ob.askHead.price), ob.askHead.quantity, true
+	return ob.toFloat64(ob.askHead.price), ob.askHead.quantity, true
 }
 
 func (ob *OrderBook) GetDepth(levels int) (asks, bids []Order) {
@@ -408,13 +480,13 @@ func (ob *OrderBook) getDepthInternal(levels int) (asks, bids []Order) {
 
 	curr := ob.bidHead
 	for curr != nil && len(bids) < levels {
-		bids = append(bids, Order{Price: toFloat64(curr.price), Quantity: curr.quantity})
+		bids = append(bids, Order{Price: ob.toFloat64(curr.price), Quantity: curr.quantity})
 		curr = curr.prev
 	}
 
 	curr = ob.askHead
 	for curr != nil && len(asks) < levels {
-		asks = append(asks, Order{Price: toFloat64(curr.price), Quantity: curr.quantity})
+		asks = append(asks, Order{Price: ob.toFloat64(curr.price), Quantity: curr.quantity})
 		curr = curr.next
 	}
 
@@ -428,7 +500,7 @@ func (ob *OrderBook) GetMid() (mid float64, ok bool) {
 	if ob.bidHead == nil || ob.askHead == nil {
 		return 0, false
 	}
-	return toFloat64(ob.bidHead.price+ob.askHead.price) / 2, true
+	return ob.toFloat64(ob.bidHead.price+ob.askHead.price) / 2, true
 }
 
 func (ob *OrderBook) GetSpread() (spread float64, ok bool) {
@@ -438,7 +510,7 @@ func (ob *OrderBook) GetSpread() (spread float64, ok bool) {
 	if ob.bidHead == nil || ob.askHead == nil {
 		return 0, false
 	}
-	return toFloat64(ob.askHead.price - ob.bidHead.price), true
+	return ob.toFloat64(ob.askHead.price - ob.bidHead.price), true
 }
 
 func (ob *OrderBook) GetVersion() uint64 {
@@ -446,7 +518,7 @@ func (ob *OrderBook) GetVersion() uint64 {
 }
 
 func (ob *OrderBook) insertBid(price float64, quantity float64) {
-	priceInt := toInt64(price)
+	priceInt := ob.toInt64(price)
 	level := ob.searchOrInsert(ob.bids, priceInt, true)
 	if level != nil {
 		level.quantity = quantity
@@ -454,7 +526,7 @@ func (ob *OrderBook) insertBid(price float64, quantity float64) {
 }
 
 func (ob *OrderBook) insertAsk(price float64, quantity float64) {
-	priceInt := toInt64(price)
+	priceInt := ob.toInt64(price)
 	level := ob.searchOrInsert(ob.asks, priceInt, false)
 	if level != nil {
 		level.quantity = quantity
@@ -465,7 +537,7 @@ func (ob *OrderBook) updateBid(price float64, quantity float64) {
 	if quantity == 0 {
 		ob.removeBid(price)
 	} else {
-		priceInt := toInt64(price)
+		priceInt := ob.toInt64(price)
 		level := ob.findBid(priceInt)
 		if level != nil {
 			level.quantity = quantity
@@ -479,7 +551,7 @@ func (ob *OrderBook) updateAsk(price float64, quantity float64) {
 	if quantity == 0 {
 		ob.removeAsk(price)
 	} else {
-		priceInt := toInt64(price)
+		priceInt := ob.toInt64(price)
 		level := ob.findAsk(priceInt)
 		if level != nil {
 			level.quantity = quantity
@@ -490,7 +562,7 @@ func (ob *OrderBook) updateAsk(price float64, quantity float64) {
 }
 
 func (ob *OrderBook) removeBid(price float64) {
-	priceInt := toInt64(price)
+	priceInt := ob.toInt64(price)
 	// Check if the price exists before removing
 	if ob.findBid(priceInt) == nil {
 		return
@@ -505,7 +577,7 @@ func (ob *OrderBook) removeBid(price float64) {
 }
 
 func (ob *OrderBook) removeAsk(price float64) {
-	priceInt := toInt64(price)
+	priceInt := ob.toInt64(price)
 	// Check if the price exists before removing
 	if ob.findAsk(priceInt) == nil {
 		return
@@ -1068,7 +1140,7 @@ func (ob *OrderBook) dumpNode(sb *strings.Builder, n *bnode, depth int) {
 				sb.WriteString(", ")
 			}
 			if level != nil {
-				sb.WriteString(fmt.Sprintf("%.2f:%.4f", toFloat64(level.price), level.quantity))
+				sb.WriteString(fmt.Sprintf("%.2f:%.4f", ob.toFloat64(level.price), level.quantity))
 			} else {
 				sb.WriteString("nil")
 			}
@@ -1099,7 +1171,7 @@ func (ob *OrderBook) validateAndPanic(asksInput, bidsInput []Order) {
 
 		for _, bid := range bidsInput {
 			if bid.Quantity > 0 {
-				bidInt := toInt64(bid.Price)
+				bidInt := ob.toInt64(bid.Price)
 				if highestBidInt < 0 || bidInt > highestBidInt {
 					highestBidInt = bidInt
 				}
@@ -1108,7 +1180,7 @@ func (ob *OrderBook) validateAndPanic(asksInput, bidsInput []Order) {
 
 		for _, ask := range asksInput {
 			if ask.Quantity > 0 {
-				askInt := toInt64(ask.Price)
+				askInt := ob.toInt64(ask.Price)
 				if lowestAskInt < 0 || askInt < lowestAskInt {
 					lowestAskInt = askInt
 				}
@@ -1147,11 +1219,11 @@ func (ob *OrderBook) validateAndPanic(asksInput, bidsInput []Order) {
 		panicMsg.WriteString("\n=== Orderbook State ===\n")
 		panicMsg.WriteString(fmt.Sprintf("BidHead: %v\n", ob.bidHead != nil))
 		if ob.bidHead != nil {
-			panicMsg.WriteString(fmt.Sprintf("  Best Bid: Price=%.4f, Quantity=%.4f\n", toFloat64(ob.bidHead.price), ob.bidHead.quantity))
+			panicMsg.WriteString(fmt.Sprintf("  Best Bid: Price=%.4f, Quantity=%.4f\n", ob.toFloat64(ob.bidHead.price), ob.bidHead.quantity))
 		}
 		panicMsg.WriteString(fmt.Sprintf("AskHead: %v\n", ob.askHead != nil))
 		if ob.askHead != nil {
-			panicMsg.WriteString(fmt.Sprintf("  Best Ask: Price=%.4f, Quantity=%.4f\n", toFloat64(ob.askHead.price), ob.askHead.quantity))
+			panicMsg.WriteString(fmt.Sprintf("  Best Ask: Price=%.4f, Quantity=%.4f\n", ob.toFloat64(ob.askHead.price), ob.askHead.quantity))
 		}
 
 		asks, bids := ob.getDepthInternal(10)
