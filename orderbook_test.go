@@ -1278,6 +1278,51 @@ func TestPriceDecimalsBounds(t *testing.T) {
 	if !ok || bid != 1000.5 {
 		t.Fatalf("best bid = %v (ok=%v), want exactly 1000.5", bid, ok)
 	}
+
+	// At 12 decimals 65000.1*1e12 = 6.5e16 is past 2^53, where every float64
+	// is integral and the quantization check would pass a non-exact price.
+	version := ob.GetVersion()
+	err = ob.UpdateDelta([]Order{}, []Order{{Price: 65000.1, Quantity: 1}})
+	if !errors.Is(err, ErrPriceNotRepresentable) {
+		t.Fatalf("UpdateDelta(65000.1) at 12 decimals: error = %v, want ErrPriceNotRepresentable", err)
+	}
+	bid, _, ok = ob.GetBestBid()
+	if !ok || bid != 1000.5 {
+		t.Fatalf("best bid = %v (ok=%v), want 1000.5 after refused delta", bid, ok)
+	}
+	if got := ob.GetVersion(); got != version {
+		t.Fatalf("version = %d, want %d after refused delta", got, version)
+	}
+
+	// 9000.5*1e12 = 9.0005e15 stays below 2^53 and is held exactly.
+	if err := ob.UpdateDelta([]Order{}, []Order{{Price: 9000.5, Quantity: 1}}); err != nil {
+		t.Fatalf("UpdateDelta(9000.5) at 12 decimals: %v", err)
+	}
+	bid, _, ok = ob.GetBestBid()
+	if !ok || bid != 9000.5 {
+		t.Fatalf("best bid = %v (ok=%v), want exactly 9000.5", bid, ok)
+	}
+
+	// At the default 8 decimals the limit is 2^53/1e8 = 90071992.54740992.
+	ob = NewOrderBook(10)
+	if err := ob.UpdateDelta([]Order{}, []Order{
+		{Price: 65000.1, Quantity: 1},
+		{Price: 90000000.12345678, Quantity: 1},
+	}); err != nil {
+		t.Fatalf("UpdateDelta at 8 decimals below 2^53: %v", err)
+	}
+	bid, _, ok = ob.GetBestBid()
+	if !ok || bid != 90000000.12345678 {
+		t.Fatalf("best bid = %v (ok=%v), want exactly 90000000.12345678", bid, ok)
+	}
+	err = ob.UpdateDelta([]Order{}, []Order{{Price: 100000000.5, Quantity: 1}})
+	if !errors.Is(err, ErrPriceNotRepresentable) {
+		t.Fatalf("UpdateDelta(100000000.5) at 8 decimals: error = %v, want ErrPriceNotRepresentable", err)
+	}
+	bid, _, ok = ob.GetBestBid()
+	if !ok || bid != 90000000.12345678 {
+		t.Fatalf("best bid = %v (ok=%v), want 90000000.12345678 after refused delta", bid, ok)
+	}
 }
 
 func TestDefaultScaleTypicalPrices(t *testing.T) {

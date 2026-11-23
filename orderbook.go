@@ -68,7 +68,7 @@ type OrderBook struct {
 }
 
 // NewOrderBookWithDecimals returns a book whose prices are held in units of 10^-decimals.
-// Prices are exact while price*10^decimals stays below 2^53; it must stay below 9.2e18.
+// Prices are held exactly while price*10^decimals stays below 2^53; larger ones are refused.
 func NewOrderBookWithDecimals(maxDepth, decimals int) (*OrderBook, error) {
 	if decimals < 0 || decimals > MaxPriceDecimals {
 		return nil, fmt.Errorf("orderbook: price decimals %d outside 0..%d", decimals, MaxPriceDecimals)
@@ -101,10 +101,12 @@ func (ob *OrderBook) toFloat64(i int64) float64 {
 }
 
 // checkPrice reports whether f is held exactly at the book's scale: the
-// quantization error must be within float64's own resolution of f*scale.
+// quantization error must be within float64's own resolution of f*scale, and
+// f*scale must stay below 2^53, where float64 steps by 1 or more and an
+// inexact price would look integral.
 func (ob *OrderBook) checkPrice(f float64) error {
 	x := f * ob.scale
-	if math.IsNaN(x) || math.IsInf(x, 0) || math.Abs(x) >= 9.2e18 {
+	if math.IsNaN(x) || math.IsInf(x, 0) || math.Abs(x) >= 0x1p53 {
 		return fmt.Errorf("%w: %v at %d decimals (out of range)", ErrPriceNotRepresentable, f, ob.decimals)
 	}
 	if e := math.Abs(x - math.Round(x)); e > max(1e-6, math.Abs(x)*0x1p-50) {
@@ -282,7 +284,7 @@ func (ob *OrderBook) trimToMaxDepth() {
 
 // UpdateSnapshot replaces the price levels covered by the snapshot. It returns
 // ErrPriceNotRepresentable (wrapped) and leaves the book unchanged when a
-// price is finer than the book's scale.
+// price is finer than the book's scale or price*10^decimals reaches 2^53.
 func (ob *OrderBook) UpdateSnapshot(asks, bids []Order) error {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
@@ -422,7 +424,7 @@ func (ob *OrderBook) inSnapshot(priceInt int64) bool {
 
 // UpdateDelta applies incremental level updates. It returns
 // ErrPriceNotRepresentable (wrapped) and leaves the book unchanged when a
-// price is finer than the book's scale.
+// price is finer than the book's scale or price*10^decimals reaches 2^53.
 func (ob *OrderBook) UpdateDelta(asks, bids []Order) error {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
